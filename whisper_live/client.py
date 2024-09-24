@@ -12,11 +12,13 @@ import uuid
 import time
 import ffmpeg
 import whisper_live.utils as utils
+from websocket_server import WebsocketServer  # Import the WebSocket server library
 
 
 class Client:
     """
-    Handles communication with a server using WebSocket.
+    Handles communication with a server using WebSocket and relays processed
+    transcription data to connected clients via its own WebSocket server.
     """
     INSTANCES = {}
     END_OF_AUDIO = "END_OF_AUDIO"
@@ -30,20 +32,21 @@ class Client:
         model="small",
         srt_file_path="output.srt",
         use_vad=True,
-        log_transcription=True
+        log_transcription=True,
+        relay_host='0.0.0.0',
+        relay_port=9001
     ):
         """
-        Initializes a Client instance for audio recording and streaming to a server.
-
-        If host and port are not provided, the WebSocket connection will not be established.
-        When translate is True, the task will be set to "translate" instead of "transcribe".
-        he audio recording starts immediately upon initialization.
+        Initializes a Client instance for audio recording and streaming to a server,
+        and sets up a WebSocket server to relay processed transcription data.
 
         Args:
             host (str): The hostname or IP address of the server.
             port (int): The port number for the WebSocket server.
             lang (str, optional): The selected language for transcription. Default is None.
             translate (bool, optional): Specifies if the task is translation. Default is False.
+            relay_host (str, optional): The hostname for the relay WebSocket server. Default is '0.0.0.0'.
+            relay_port (int, optional): The port number for the relay WebSocket server. Default is 9001.
         """
         self.recording = False
         self.task = "transcribe"
@@ -59,6 +62,10 @@ class Client:
         self.last_segment = None
         self.last_received_segment = None
         self.log_transcription = log_transcription
+
+        self.relay_host = relay_host
+        self.relay_port = relay_port
+        self.relay_clients = []
 
         if translate:
             self.task = "translate"
@@ -82,13 +89,36 @@ class Client:
 
         Client.INSTANCES[self.uid] = self
 
-        # start websocket client in a thread
+        # Initialize and start the relay WebSocket server
+        self.relay_server = WebsocketServer(host=self.relay_host, port=self.relay_port)
+        self.relay_server.set_fn_new_client(self.new_client)
+        self.relay_server.set_fn_client_left(self.client_left)
+        self.relay_server.set_fn_message_received(self.message_received)
+        self.relay_thread = threading.Thread(target=self.relay_server.run_forever)
+        self.relay_thread.setDaemon(True)
+        self.relay_thread.start()
+
+        # Start WebSocket client in a thread
         self.ws_thread = threading.Thread(target=self.client_socket.run_forever)
         self.ws_thread.setDaemon(True)
         self.ws_thread.start()
 
         self.transcript = []
         print("[INFO]: * recording")
+
+    def new_client(self, client, server):
+        """Handles new client connections to the relay server."""
+        print(f"[Relay Server] New client connected: {client['id']}")
+        self.relay_clients.append(client)
+
+    def client_left(self, client, server):
+        """Handles client disconnections from the relay server."""
+        print(f"[Relay Server] Client disconnected: {client['id']}")
+        self.relay_clients.remove(client)
+
+    def message_received(self, client, server, message):
+        """Handles messages received from relay clients (if needed)."""
+        pass  # Currently no action needed on received messages
 
     def handle_status_messages(self, message_data):
         """Handles server status messages."""
@@ -103,7 +133,7 @@ class Client:
             print(f"Message from Server: {message_data['message']}")
 
     def process_segments(self, segments):
-        """Processes transcript segments."""
+        """Processes transcript segments and relays the output text data."""
         text = []
         for i, seg in enumerate(segments):
             if not text or text[-1] != seg["text"]:
@@ -114,7 +144,7 @@ class Client:
                       (not self.transcript or
                         float(seg['start']) >= float(self.transcript[-1]['end']))):
                     self.transcript.append(seg)
-        # update last received segment and last valid response time
+        # Update last received segment and last valid response time
         if self.last_received_segment is None or self.last_received_segment != segments[-1]["text"]:
             self.last_response_received = time.time()
             self.last_received_segment = segments[-1]["text"]
@@ -124,6 +154,13 @@ class Client:
             text = text[-3:]
             utils.clear_screen()
             utils.print_transcript(text)
+
+        # Relay the output text data to connected clients
+        if self.relay_clients:
+            data_to_send = {'text': text[-1]}  # Send the latest text segment
+            message = json.dumps(data_to_send)
+            for client in self.relay_clients:
+                self.relay_server.send_message(client, message)
 
     def on_message(self, ws, message):
         """
@@ -219,21 +256,33 @@ class Client:
 
     def close_websocket(self):
         """
-        Close the WebSocket connection and join the WebSocket thread.
+        Close the WebSocket connections and join the threads.
 
-        First attempts to close the WebSocket connection using `self.client_socket.close()`. After
-        closing the connection, it joins the WebSocket thread to ensure proper termination.
-
+        Closes both the client WebSocket connection and the relay WebSocket server.
         """
+        # Close the client WebSocket connection
         try:
             self.client_socket.close()
         except Exception as e:
-            print("[ERROR]: Error closing WebSocket:", e)
+            print("[ERROR]: Error closing client WebSocket:", e)
 
+        # Close the relay WebSocket server
+        try:
+            self.relay_server.shutdown()
+        except Exception as e:
+            print("[ERROR]: Error shutting down relay WebSocket server:", e)
+
+        # Join the client WebSocket thread
         try:
             self.ws_thread.join()
         except Exception as e:
-            print("[ERROR:] Error joining WebSocket thread:", e)
+            print("[ERROR]: Error joining client WebSocket thread:", e)
+
+        # Join the relay WebSocket server thread
+        try:
+            self.relay_thread.join()
+        except Exception as e:
+            print("[ERROR]: Error joining relay WebSocket thread:", e)
 
     def get_client_socket(self):
         """
@@ -363,11 +412,7 @@ class TranscriptionTeeClient:
         Play an audio file and send it to the server for processing.
 
         Reads an audio file, plays it through the audio output, and simultaneously sends
-        the audio data to the server for processing. It uses PyAudio to create an audio
-        stream for playback. The audio data is read from the file in chunks, converted to
-        floating-point format, and sent to the server using WebSocket communication.
-        This method is typically used when you want to process pre-recorded audio and send it
-        to the server in real-time.
+        the audio data to the server for processing.
 
         Args:
             filename (str): The path to the audio file to be played and sent to the server.
@@ -497,8 +542,8 @@ class TranscriptionTeeClient:
         Saves the current audio frames to a WAV file in a separate thread.
 
         Args:
-        n_audio_file (int): The index of the audio file which determines the filename.
-                            This helps in maintaining the order and uniqueness of each chunk.
+            n_audio_file (int): The index of the audio file which determines the filename.
+                                This helps in maintaining the order and uniqueness of each chunk.
         """
         t = threading.Thread(
             target=self.write_audio_frames_to_file,
@@ -512,8 +557,8 @@ class TranscriptionTeeClient:
         closing the audio stream, and terminating the process.
 
         Args:
-        n_audio_file (int): The file index to be used if there are remaining audio frames to be saved.
-                            This index is incremented before use if the last chunk is saved.
+            n_audio_file (int): The file index to be used if there are remaining audio frames to be saved.
+                                This index is incremented before use if the last chunk is saved.
         """
         if self.save_output_recording and len(self.frames):
             self.write_audio_frames_to_file(
@@ -533,13 +578,7 @@ class TranscriptionTeeClient:
         Record audio data from the input stream and save it to a WAV file.
 
         Continuously records audio data from the input stream, sends it to the server via a WebSocket
-        connection, and simultaneously saves it to multiple WAV files in chunks. It stops recording when
-        the `RECORD_SECONDS` duration is reached or when the `RECORDING` flag is set to `False`.
-
-        Audio data is saved in chunks to the "chunks" directory. Each chunk is saved as a separate WAV file.
-        The recording will continue until the specified duration is reached or until the `RECORDING` flag is set to `False`.
-        The recording process can be interrupted by sending a KeyboardInterrupt (e.g., pressing Ctrl+C). After recording,
-        the method combines all the saved audio chunks into the specified `out_file`.
+        connection, and simultaneously saves it to multiple WAV files in chunks.
         """
         n_audio_file = 0
         if self.save_output_recording:
@@ -557,7 +596,7 @@ class TranscriptionTeeClient:
 
                 self.multicast_packet(audio_array.tobytes())
 
-                # save frames if more than a minute
+                # Save frames if more than a minute
                 if len(self.frames) > 60 * self.rate:
                     if self.save_output_recording:
                         self.save_chunk(n_audio_file)
@@ -571,9 +610,6 @@ class TranscriptionTeeClient:
     def write_audio_frames_to_file(self, frames, file_name):
         """
         Write audio frames to a WAV file.
-
-        The WAV file is created or overwritten with the specified name. The audio frames should be
-        in the correct format and match the specified channel, sample width, and sample rate.
 
         Args:
             frames (bytes): The audio frames to be written to the file.
@@ -591,15 +627,8 @@ class TranscriptionTeeClient:
         """
         Combine and save recorded audio chunks into a single WAV file.
 
-        The individual audio chunk files are expected to be located in the "chunks" directory. Reads each chunk
-        file, appends its audio data to the final recording, and then deletes the chunk file. After combining
-        and saving, the final recording is stored in the specified `out_file`.
-
-
         Args:
             n_audio_file (int): The number of audio chunk files to combine.
-            out_file (str): The name of the output WAV file to save the final recording.
-
         """
         input_files = [
             f"chunks/{i}.wav"
@@ -618,10 +647,10 @@ class TranscriptionTeeClient:
                         if data == b"":
                             break
                         wavfile.writeframes(data)
-                # remove this file
+                # Remove this file
                 os.remove(in_file)
         wavfile.close()
-        # clean up temporary directory to store chunks
+        # Clean up temporary directory to store chunks
         if os.path.exists("chunks"):
             shutil.rmtree("chunks")
 
@@ -630,8 +659,7 @@ class TranscriptionTeeClient:
         """
         Convert audio data from bytes to a NumPy float array.
 
-        It assumes that the audio data is in 16-bit PCM format. The audio data is normalized to
-        have values between -1 and 1.
+        It assumes that the audio data is in 16-bit PCM format.
 
         Args:
             audio_bytes (bytes): Audio data in bytes.
@@ -647,27 +675,20 @@ class TranscriptionClient(TranscriptionTeeClient):
     """
     Client for handling audio transcription tasks via a single WebSocket connection.
 
-    Acts as a high-level client for audio transcription tasks using a WebSocket connection. It can be used
-    to send audio data for transcription to a server and receive transcribed text segments.
+    Acts as a high-level client for audio transcription tasks using a WebSocket connection.
 
     Args:
         host (str): The hostname or IP address of the server.
         port (int): The port number to connect to on the server.
-        lang (str, optional): The primary language for transcription. Default is None, which defaults to English ('en').
+        lang (str, optional): The primary language for transcription. Default is None.
         translate (bool, optional): Indicates whether translation tasks are required (default is False).
         save_output_recording (bool, optional): Indicates whether to save recording from microphone.
         output_recording_filename (str, optional): File to save the output recording.
         output_transcription_path (str, optional): File to save the output transcription.
+        log_transcription (bool, optional): Indicates whether to log transcription to console.
 
     Attributes:
         client (Client): An instance of the underlying Client class responsible for handling the WebSocket connection.
-
-    Example:
-        To create a TranscriptionClient and start transcription on microphone audio:
-        ```python
-        transcription_client = TranscriptionClient(host="localhost", port=9090)
-        transcription_client()
-        ```
     """
     def __init__(
         self,
@@ -681,8 +702,17 @@ class TranscriptionClient(TranscriptionTeeClient):
         output_recording_filename="./output_recording.wav",
         output_transcription_path="./output.srt",
         log_transcription=True,
+        relay_host='0.0.0.0',
+        relay_port=9001
     ):
-        self.client = Client(host, port, lang, translate, model, srt_file_path=output_transcription_path, use_vad=use_vad, log_transcription=log_transcription)
+        self.client = Client(
+            host, port, lang, translate, model,
+            srt_file_path=output_transcription_path,
+            use_vad=use_vad,
+            log_transcription=log_transcription,
+            relay_host=relay_host,
+            relay_port=relay_port
+        )
         if save_output_recording and not output_recording_filename.endswith(".wav"):
             raise ValueError(f"Please provide a valid `output_recording_filename`: {output_recording_filename}")
         if not output_transcription_path.endswith(".srt"):
